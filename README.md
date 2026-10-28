@@ -194,4 +194,4 @@ Results are included for all of these: altitude-banded TDMA, slotted access near
 
 ## Team
 
-Dr. K. Priyadarsini (PI), Dr. Revathy Venkataraman, Dr. S. Karthik, Dr. P. Rajasekaran, SRM Institute of Science and Technology.
+Dr. K. Priyadarsini (PI), Dr. Revathi Venkataraman, Dr. S. Karthik, Dr. P. Rajasekaran, SRM Institute of Science and Technology.
