@@ -43,6 +43,7 @@
 #include <cmath>
 #include <cstdlib>
 #include <fstream>
+#include <iterator>
 #include <map>
 #include <vector>
 
@@ -417,6 +418,115 @@ struct C2Rec
 };
 static C2Rec g_c2Rec;
 
+// =====================================================================================
+//  Version 12: TWO-WAY C2 (uplink drone -> ground AND downlink ground -> drone)
+// =====================================================================================
+//  Everything up to version 11b measured C2 in one direction only: ten drones reporting
+//  to the ground station. Real C2 is two-way, and the 3GPP TS 22.125 direct-steering
+//  profile this traffic is taken from is actually a COMMAND from the controller to the
+//  UAV. With --c2Downlink=1 the ground station also sends a 120-byte command every 40 ms
+//  to each C2 drone, with the same 40 ms deadline, through the same protected N1 window
+//  and (with --c2Route=1) under the same short-link rule.
+//
+//  Routing toward a MOVING destination needs to know where the destination is. Uplink
+//  does not need this: the ground station never moves, so "closer to the ground" is a
+//  quantity every drone can compute on its own. Downlink has no such shortcut. In a real
+//  system the uplink report carries the drone's own GPS fix, so the ground station knows
+//  where each C2 drone was when it last reported, and can put that fix in the command it
+//  sends back. That is exactly what is modelled here:
+//
+//    * g_c2FixInFlight[(k,seq)] is the fix drone k stamped on its uplink report seq.
+//    * g_c2DestBelief[k] is updated ONLY when that report actually ARRIVES at the ground
+//      (so a lost or late report leaves the ground with an older fix).
+//    * every relay extrapolates from that one stale fix, which is what it would do with a
+//      fix carried inside the packet.
+//
+//  --c2DlPos=ideal replaces the fix with the destination's true current position. That is
+//  not implementable, but it brackets the result: the gap between "tracked" and "ideal"
+//  is the cost of not knowing exactly where the destination is.
+struct C2Fix
+{
+    Vector p;
+    Vector v;
+    double t{-1.0};
+};
+static Vector Noisy(Vector p); // defined further down, with the other N2 helpers
+static bool g_n2Real = false;  // true = beliefs from beacons; false = exact (moved up: the
+                               // C2 apps stamp their own fix and need to know which mode)
+
+static bool g_c2Downlink = false;
+static bool g_c2DlIdealPos = false;        // true = exact destination position (upper bound)
+static double g_c2DlMaxAgeS = 1.0;         // a destination fix older than this is unusable
+static std::vector<uint32_t> g_c2DestNode; // C2 drone k -> node index
+static std::vector<Ipv4Address> g_c2DestAddr;
+static std::map<uint32_t, uint32_t> g_ipToDl;  // destination IP -> k
+static std::map<uint32_t, uint32_t> g_nodeToDl; // node index -> k
+static std::vector<C2Fix> g_c2DestBelief;      // ground's last known fix of each C2 drone
+static std::map<uint64_t, C2Fix> g_c2FixInFlight;
+static std::vector<std::vector<int>> g_n2NextHopDl; // [node][k] -> next hop, -1 = none
+static uint32_t g_groundIdx = 0;
+static C2Rec g_c2RecDl;
+static double g_c2DlExpected = 0.0;
+static uint64_t g_c2DlSwitches = 0;
+static uint64_t g_c2DlNoPos = 0;    // no usable destination fix, so no downlink route
+static uint64_t g_c2DlNoRelay = 0;  // fix known, but no safe relay toward it
+static uint64_t g_c2DlSrcFail = 0;  // the ground station could not send at all
+static uint64_t g_c2StaleDl = 0;    // downlink C2 discarded as too old
+
+// =====================================================================================
+//  Version 13: PRED, a predictive-routing BASELINE (--routing=PRED)
+// =====================================================================================
+//  N2 is compared against OLSR and AODV, and neither of those predicts anything. That
+//  comparison cannot show what N2's prediction is worth, because any predictive scheme
+//  would beat them. Published predictive routing for mobile ad-hoc and UAV networks goes
+//  back to the link-expiration-time (LET) rule of Su, Lee and Gerla, and to P-OLSR for
+//  fixed-wing UAVs. PRED is that idea, implemented here as a baseline:
+//
+//    * LET for each neighbour is computed from relative position and relative velocity:
+//      the time until the distance between the two drones would exceed the radio range.
+//      A link is usable while its LET is above --letThreshS.
+//    * The route is written into the IP table at each update and then LEFT ALONE, so the
+//      next hop is whatever the table said when the packet was enqueued.
+//    * When no neighbour qualifies, the PREVIOUS route is kept. Packets go into a link
+//      that is already failing, which is what a routing table does.
+//    * C2 follows the same route as video: no separate relay chain.
+//
+//  It uses the same beacons, the same beacon loss, the same GPS error, the same radio and
+//  the same N1 window as N2, so the only differences left are the three mechanisms this
+//  proposal actually claims: late binding of the next hop at the moment of transmission,
+//  holding data when no relay qualifies, and a traffic-class-specific relay chain.
+//
+//  PRED is NOT a reimplementation of any published protocol and must not be reported as
+//  one. It is the LET prediction rule on this project's own routing substrate, which is
+//  what makes the ablation honest: every step of the ladder differs by one mechanism.
+static bool g_predMode = false;     // true = PRED baseline instead of N2
+static bool g_predHold = false;     // PRED + hold-and-deadline (ladder step 3)
+static double g_letThreshS = 1.0;   // a link is usable while its LET exceeds this
+static bool g_baseQueue = false;    // give OLSR/AODV N2's queue discipline, not its routing
+static uint64_t g_predStaleKeep = 0; // times PRED kept a route no neighbour justified
+
+// Link expiration time: how long until these two drones drift out of radio range,
+// from their current relative position and velocity. Su, Lee and Gerla's rule.
+// Returns a large number when the relative motion keeps them in range indefinitely.
+static double
+LinkExpiry(const Vector& pi, const Vector& vi, const Vector& pj, const Vector& vj, double range)
+{
+    Vector d(pi.x - pj.x, pi.y - pj.y, pi.z - pj.z);
+    Vector w(vi.x - vj.x, vi.y - vj.y, vi.z - vj.z);
+    double a = w.x * w.x + w.y * w.y + w.z * w.z;
+    double c = d.x * d.x + d.y * d.y + d.z * d.z - range * range;
+    if (c > 0.0)
+        return 0.0; // already out of range
+    if (a < 1e-9)
+        return 1e9; // no relative motion: the link does not expire
+    double b = 2.0 * (d.x * w.x + d.y * w.y + d.z * w.z);
+    double disc = b * b - 4.0 * a * c;
+    if (disc <= 0.0)
+        return 1e9;
+    double t = (-b + std::sqrt(disc)) / (2.0 * a);
+    return t > 0.0 ? t : 0.0;
+}
+
 static void
 C2Receive(Ptr<Socket> s)
 {
@@ -433,14 +543,74 @@ C2Receive(Ptr<Socket> s)
             ++g_c2Rec.dupes;
         else
             g_c2Rec.firstDelay[key] = d;
+
+        // The report has arrived, so the ground station now knows where this drone was
+        // when it sent it. This is the only way the ground learns the position of a drone
+        // that is several hops away, and it is what the downlink route is computed from.
+        if (g_c2Downlink)
+        {
+            auto ni = g_ipToDl.find(static_cast<uint32_t>(src));
+            if (ni != g_ipToDl.end())
+            {
+                uint64_t fkey = (static_cast<uint64_t>(ni->second) << 32) | h.GetSeq();
+                auto fi = g_c2FixInFlight.find(fkey);
+                if (fi != g_c2FixInFlight.end())
+                {
+                    if (fi->second.t > g_c2DestBelief[ni->second].t)
+                        g_c2DestBelief[ni->second] = fi->second;
+                    g_c2FixInFlight.erase(fi);
+                }
+            }
+            // drop fixes whose report will never arrive, so the map stays small
+            if (g_c2FixInFlight.size() > 8 * g_c2DestBelief.size() + 16)
+            {
+                double cut = Simulator::Now().GetSeconds() - 2.0;
+                for (auto it = g_c2FixInFlight.begin(); it != g_c2FixInFlight.end();)
+                    it = (it->second.t < cut) ? g_c2FixInFlight.erase(it) : std::next(it);
+            }
+        }
+    }
+}
+
+// Downlink command received at drone k. One callback per drone, so k is known.
+static void
+C2ReceiveDl(uint32_t k, Ptr<Socket> s)
+{
+    Address from;
+    Ptr<Packet> pk;
+    while ((pk = s->RecvFrom(from)))
+    {
+        SeqTsHeader h;
+        pk->RemoveHeader(h);
+        uint64_t key = (static_cast<uint64_t>(k) << 32) | h.GetSeq();
+        double d = (Simulator::Now() - h.GetTs()).GetSeconds();
+        if (g_c2RecDl.firstDelay.count(key))
+            ++g_c2RecDl.dupes;
+        else
+            g_c2RecDl.firstDelay[key] = d;
     }
 }
 
 static void
-C2SendTick(Ptr<Socket> s1, Ptr<Socket> s2, uint32_t seq, uint32_t bytes, Time interval, Time stop)
+C2SendTick(uint32_t srcIdx, Ptr<Socket> s1, Ptr<Socket> s2, uint32_t seq, uint32_t bytes,
+           Time interval, Time stop)
 {
     if (Simulator::Now() >= stop)
         return;
+    // Stamp this report with my own GPS fix, as a real telemetry/C2 report would carry it.
+    if (g_c2Downlink && srcIdx < g_n2Nodes.GetN())
+    {
+        auto ki = g_nodeToDl.find(srcIdx);
+        if (ki != g_nodeToDl.end())
+        {
+            Ptr<MobilityModel> m = g_n2Nodes.Get(srcIdx)->GetObject<MobilityModel>();
+            C2Fix f;
+            f.p = g_n2Real ? Noisy(m->GetPosition()) : m->GetPosition();
+            f.v = m->GetVelocity();
+            f.t = Simulator::Now().GetSeconds();
+            g_c2FixInFlight[(static_cast<uint64_t>(ki->second) << 32) | seq] = f;
+        }
+    }
     for (Ptr<Socket> s : {s1, s2})
     {
         if (!s)
@@ -452,7 +622,22 @@ C2SendTick(Ptr<Socket> s1, Ptr<Socket> s2, uint32_t seq, uint32_t bytes, Time in
         if (s->Send(pk) < 0)
             ++g_c2SrcFail;
     }
-    Simulator::Schedule(interval, &C2SendTick, s1, s2, seq + 1, bytes, interval, stop);
+    Simulator::Schedule(interval, &C2SendTick, srcIdx, s1, s2, seq + 1, bytes, interval, stop);
+}
+
+// The ground station's command to drone k: same size and period as the uplink report.
+static void
+C2SendTickDl(uint32_t k, Ptr<Socket> s, uint32_t seq, uint32_t bytes, Time interval, Time stop)
+{
+    if (Simulator::Now() >= stop)
+        return;
+    SeqTsHeader h;
+    h.SetSeq(seq);
+    Ptr<Packet> pk = Create<Packet>(bytes > 12 ? bytes - 12 : 0);
+    pk->AddHeader(h);
+    if (s->Send(pk) < 0)
+        ++g_c2DlSrcFail;
+    Simulator::Schedule(interval, &C2SendTickDl, k, s, seq + 1, bytes, interval, stop);
 }
 
 // ---------------- N2 version 6 additions ----------------
@@ -470,7 +655,7 @@ struct N2Belief
     double t{-1.0};
 };
 static std::vector<std::vector<N2Belief>> g_n2Seen; // g_n2Seen[i][j] = what i believes about j
-static bool g_n2Real = false;                       // true = beliefs from beacons; false = exact
+// (g_n2Real is declared further up, with the version-12 globals, because the C2 apps need it)
 static double g_n2BeaconLoss = 0.0;                 // probability a beacon is lost at a receiver
 static double g_n2GpsErr = 0.0;                     // GPS error, metres (standard deviation per axis)
 static double g_n2BeaconS = 0.1;                    // beacon interval, seconds
@@ -648,6 +833,10 @@ class N2HoldQueueDisc : public QueueDisc
 
     Ptr<QueueDiscItem> Bind(Ptr<QueueDiscItem> item, bool isUav, int nh)
     {
+        if (g_predMode)
+        {
+            return item; // PRED baseline: the next hop is whatever the routing table said
+        }
         Ptr<Ipv4QueueDiscItem> ip = DynamicCast<Ipv4QueueDiscItem>(item);
         if (isUav && nh >= 0 && ip && ip->GetHeader().GetDestination() == g_n2Ground)
         {
@@ -660,7 +849,29 @@ class N2HoldQueueDisc : public QueueDisc
             return Create<Ipv4QueueDiscItem>(ip->GetPacket(), g_n2Macs[use], ip->GetProtocol(),
                                              ip->GetHeader());
         }
+        // Downlink C2: late binding toward a MOVING destination. Works the same way at the
+        // ground station (first hop) and at every relay on the way.
+        if (g_c2Downlink && ip && m_idx < g_n2NextHopDl.size())
+        {
+            auto it = g_ipToDl.find(ip->GetHeader().GetDestination().Get());
+            if (it != g_ipToDl.end())
+            {
+                int use = g_n2NextHopDl[m_idx][it->second];
+                if (use >= 0)
+                    return Create<Ipv4QueueDiscItem>(ip->GetPacket(), g_n2Macs[use],
+                                                     ip->GetProtocol(), ip->GetHeader());
+            }
+        }
         return item;
+    }
+
+    // Is this a downlink command (ground -> drone) rather than an uplink report?
+    static bool IsDownlink(Ptr<QueueDiscItem> item)
+    {
+        if (!g_c2Downlink)
+            return false;
+        Ptr<Ipv4QueueDiscItem> ip = DynamicCast<Ipv4QueueDiscItem>(item);
+        return ip && g_ipToDl.count(ip->GetHeader().GetDestination().Get()) > 0;
     }
 
     Ptr<QueueDiscItem> DoDequeue() override
@@ -670,7 +881,21 @@ class N2HoldQueueDisc : public QueueDisc
         auto bq = GetInternalQueue(0);
         auto dq = GetInternalQueue(1);
         auto cq = GetInternalQueue(2);
-        // discard data that is already too old to be useful
+        // Two separate things must not be confused here.
+        //
+        //  (a) Discarding data past its deadline is ordinary queue management. Any sane
+        //      implementation does it, and OLSR and AODV get it from the radio's own
+        //      MaxDelay. So the PRED baseline KEEPS it. Taking it away would leave PRED
+        //      with a worse queue than OLSR has and the comparison would be worthless:
+        //      its queues fill with packets that are already useless, and the measured
+        //      delay runs into seconds for reasons that have nothing to do with routing.
+        //
+        //  (b) Refusing to transmit at all while no relay qualifies -- holding the packet
+        //      in the hope that a relay appears -- is a routing decision, and it is one of
+        //      the mechanisms this proposal claims. PRED does without it unless
+        //      --predHold=1, which is step 3 of the ladder.
+        bool holdOn = !g_predMode || g_predHold;
+        // discard data that is already too old to be useful (baseline keeps this)
         while (dq->GetNPackets() > 0 && m_deadline.IsStrictlyPositive() &&
                Simulator::Now() - dq->Peek()->GetTimeStamp() > m_deadline)
         {
@@ -684,11 +909,17 @@ class N2HoldQueueDisc : public QueueDisc
         {
             Ptr<QueueDiscItem> old = cq->Dequeue();
             DropAfterDequeue(old, "C2 deadline");
-            ++g_c2Stale;
+            if (IsDownlink(old))
+                ++g_c2StaleDl;
+            else
+                ++g_c2Stale;
         }
-        bool noRelay = isUav && nh < 0;
+        bool noRelay = isUav && nh < 0 && holdOn;
         bool radioBusy = m_macQueue && m_macQueue->GetNPackets() > 0;
-        bool winOn = g_n1C2 > 0 && isUav;
+        // When the ground station also sends C2, it must respect the protected window too,
+        // otherwise its commands would collide with the uplink reports inside the window.
+        bool dlGround = g_c2Downlink && !isUav;
+        bool winOn = g_n1C2 > 0 && (isUav || dlGround);
         int64_t now = Simulator::Now().GetNanoSeconds();
         int64_t sf = g_n1Sf.GetNanoSeconds();
         int64_t off = now % sf;
@@ -699,7 +930,7 @@ class N2HoldQueueDisc : public QueueDisc
             win = g_planWinNs;
         }
 
-        if (winOn && g_n1C2 == 2 && off < win)
+        if (winOn && isUav && g_n1C2 == 2 && off < win)
         {
             // v4: only in MY slots, one C2 message per slot
             int64_t slotNs = g_c2Tx.GetNanoSeconds();
@@ -979,6 +1210,177 @@ N2SetRoute(uint32_t i, int nextHop)
     }
 }
 
+// Downlink: write (or clear) node i's host route to C2 drone k.
+static void
+N2SetRouteDl(uint32_t i, uint32_t k, int nextHop)
+{
+    Ptr<Ipv4> ipv4 = g_n2Nodes.Get(i)->GetObject<Ipv4>();
+    Ipv4StaticRoutingHelper srh;
+    Ptr<Ipv4StaticRouting> sr = srh.GetStaticRouting(ipv4);
+    Ipv4Address dst = g_c2DestAddr[k];
+    for (int r = static_cast<int>(sr->GetNRoutes()) - 1; r >= 0; --r)
+    {
+        Ipv4RoutingTableEntry e = sr->GetRoute(r);
+        if (e.IsHost() && e.GetDest() == dst)
+        {
+            sr->RemoveRoute(r);
+        }
+    }
+    if (nextHop >= 0)
+    {
+        sr->AddHostRouteTo(dst, g_n2Ifaces.GetAddress(nextHop), 1);
+    }
+    if (i < g_n2Hold.size() && g_n2Hold[i])
+    {
+        g_n2Hold[i]->Run(); // a relay may have appeared: release held commands
+    }
+}
+
+// Downlink route selection, the mirror image of the uplink rule in N2UpdateRoutes.
+// Uplink asks "is this relay closer to the ground station?", which every drone can answer
+// because the ground station does not move. Downlink asks "is this relay closer to the
+// DESTINATION DRONE?", which needs the destination's position: the fix the destination put
+// in its last uplink report, which the ground station received and passes down the chain.
+// Progress is always measured against that one shared fix, so the chain cannot loop within
+// an update cycle. A relay that has its own fresh beacon from the destination may deliver
+// to it directly.
+static void
+N2UpdateDownlink()
+{
+    uint32_t nDrones = g_groundIdx;
+    double now = Simulator::Now().GetSeconds();
+    double limit = g_n2Hear * (g_c2Route == 1 ? g_c2SafeFrac : g_n2SafeFrac);
+
+    for (uint32_t k = 0; k < g_c2DestNode.size(); ++k)
+    {
+        uint32_t dn = g_c2DestNode[k];
+        Vector dp, dpP;
+        bool havePos = false;
+        if (g_c2DlIdealPos)
+        {
+            Ptr<MobilityModel> md = g_n2Nodes.Get(dn)->GetObject<MobilityModel>();
+            Vector p = md->GetPosition(), v = md->GetVelocity();
+            dp = p;
+            dpP = Vector(p.x + v.x * g_n2PredS, p.y + v.y * g_n2PredS, p.z + v.z * g_n2PredS);
+            havePos = true;
+        }
+        else
+        {
+            const C2Fix& f = g_c2DestBelief[k];
+            if (f.t >= 0.0 && now - f.t <= g_c2DlMaxAgeS)
+            {
+                double age = now - f.t;
+                double a2 = age + g_n2PredS;
+                dp = Vector(f.p.x + f.v.x * age, f.p.y + f.v.y * age, f.p.z + f.v.z * age);
+                dpP = Vector(f.p.x + f.v.x * a2, f.p.y + f.v.y * a2, f.p.z + f.v.z * a2);
+                havePos = true;
+            }
+        }
+
+        if (!havePos)
+        {
+            // Nobody knows where this drone is, so no command can be routed to it.
+            ++g_c2DlNoPos;
+            for (uint32_t i = 0; i <= g_groundIdx; ++i)
+            {
+                if (i == dn)
+                    continue;
+                if (g_n2NextHopDl[i][k] != -1)
+                {
+                    g_n2NextHopDl[i][k] = -1;
+                    N2SetRouteDl(i, k, -1);
+                }
+            }
+            continue;
+        }
+
+        for (uint32_t i = 0; i <= g_groundIdx; ++i)
+        {
+            if (i == dn)
+                continue;
+            Ptr<MobilityModel> mi = g_n2Nodes.Get(i)->GetObject<MobilityModel>();
+            Vector vi = mi->GetVelocity();
+            bool isGround = (i == g_groundIdx);
+            Vector pi = (g_n2Real && !isGround) ? Noisy(mi->GetPosition()) : mi->GetPosition();
+            Vector piP(pi.x + vi.x * g_n2PredS, pi.y + vi.y * g_n2PredS, pi.z + vi.z * g_n2PredS);
+            double myDist = CalculateDistance(pi, dp);
+            int best = -1;
+
+            // Am I next to the destination? My own beacon from it is fresher than the fix.
+            Vector ldp, ldpP;
+            bool local = N2Believe(i, dn, g_n2PredS, ldp, ldpP);
+            if (local)
+            {
+                if (CalculateDistance(pi, ldp) <= limit && CalculateDistance(piP, ldpP) <= limit)
+                    best = static_cast<int>(dn);
+            }
+            else if (myDist <= limit && CalculateDistance(piP, dpP) <= limit)
+            {
+                best = static_cast<int>(dn);
+            }
+
+            if (best < 0)
+            {
+                double bs = 1e18;
+                for (uint32_t j = 0; j < nDrones; ++j)
+                {
+                    if (j == i || j == dn)
+                        continue;
+                    Vector pj, pjP;
+                    if (!N2Believe(i, j, g_n2PredS, pj, pjP))
+                        continue; // no fresh beacon from j
+                    if (CalculateDistance(pi, pj) > limit || CalculateDistance(piP, pjP) > limit)
+                        continue; // not safe now, or predicted to drift away
+                    double score = CalculateDistance(pjP, dpP);
+                    if (score >= myDist - 1.0)
+                        continue; // must get closer to the destination (no loops)
+                    if (score < bs)
+                    {
+                        bs = score;
+                        best = static_cast<int>(j);
+                    }
+                }
+            }
+
+            if (best < 0)
+            {
+                // Fallback: no safe relay; use the best neighbour merely within hearing range.
+                ++g_c2DlNoRelay;
+                if (myDist < g_n2Hear)
+                {
+                    best = static_cast<int>(dn);
+                }
+                else
+                {
+                    double bestD = myDist - 1.0;
+                    for (uint32_t j = 0; j < nDrones; ++j)
+                    {
+                        if (j == i || j == dn)
+                            continue;
+                        Vector pj, pjP;
+                        if (!N2Believe(i, j, 0.0, pj, pjP))
+                            continue;
+                        double dd = CalculateDistance(pj, dp);
+                        if (CalculateDistance(pi, pj) < g_n2Hear && dd < bestD)
+                        {
+                            bestD = dd;
+                            best = static_cast<int>(j);
+                        }
+                    }
+                }
+            }
+
+            if (best != g_n2NextHopDl[i][k])
+            {
+                if (g_n2NextHopDl[i][k] != -2)
+                    ++g_c2DlSwitches;
+                g_n2NextHopDl[i][k] = best;
+                N2SetRouteDl(i, k, best);
+            }
+        }
+    }
+}
+
 static void
 N2UpdateRoutes(double intervalS)
 {
@@ -1027,8 +1429,18 @@ N2UpdateRoutes(double intervalS)
                 Vector pj, pjP;
                 if (!N2Believe(i, j, g_n2PredS, pj, pjP))
                     continue; // no fresh beacon from j
-                if (CalculateDistance(pi, pj) > safe || CalculateDistance(piP, pjP) > safe)
+                if (g_predMode)
+                {
+                    // PRED baseline: usable while the link expiration time is long enough
+                    Vector vj((pjP.x - pj.x) / g_n2PredS, (pjP.y - pj.y) / g_n2PredS,
+                              (pjP.z - pj.z) / g_n2PredS);
+                    if (LinkExpiry(pi, vi, pj, vj, g_n2Hear) < g_letThreshS)
+                        continue;
+                }
+                else if (CalculateDistance(pi, pj) > safe || CalculateDistance(piP, pjP) > safe)
+                {
                     continue; // not safe now, or predicted to drift away
+                }
                 if (CalculateDistance(pj, gpos) >= myDist - 1.0)
                     continue; // must get closer to the ground (no loops)
                 double score = CalculateDistance(pjP, gpos);
@@ -1078,7 +1490,10 @@ N2UpdateRoutes(double intervalS)
         }
 
         // 1. Ground station directly reachable and predicted to stay reachable?
-        if (myDist < safe && CalculateDistance(piP, gpos) < safe)
+        bool groundOk = g_predMode
+                            ? LinkExpiry(pi, vi, gpos, Vector(0, 0, 0), g_n2Hear) >= g_letThreshS
+                            : (myDist < safe && CalculateDistance(piP, gpos) < safe);
+        if (groundOk)
         {
             best = static_cast<int>(groundIdx);
             second = relay1; // second copy goes via a relay (or also direct if none)
@@ -1122,6 +1537,15 @@ N2UpdateRoutes(double intervalS)
             }
         }
 
+        // PRED baseline: when nothing qualifies, a routing table keeps the entry it has.
+        // Packets then go into a link that is already failing, which is the behaviour this
+        // proposal claims to avoid by holding instead.
+        if (best < 0 && g_predMode && !g_predHold && g_n2NextHop[i] >= 0)
+        {
+            ++g_predStaleKeep;
+            continue;
+        }
+
         if (g_n2NextHop2.size() > i)
             g_n2NextHop2[i] = g_c2Route == 1 ? (strictC2 >= 0 ? strictC2 : best)
                                              : (second >= 0 ? second : best);
@@ -1132,6 +1556,10 @@ N2UpdateRoutes(double intervalS)
             g_n2NextHop[i] = best;
             N2SetRoute(i, best);
         }
+    }
+    if (g_c2Downlink && !g_c2DestNode.empty())
+    {
+        N2UpdateDownlink();
     }
     Simulator::Schedule(Seconds(intervalS), &N2UpdateRoutes, intervalS);
 }
@@ -1151,7 +1579,10 @@ N2SendBeacon(uint32_t j, Ptr<Socket> s, double intervalS, Ptr<UniformRandomVaria
         b.v = mj->GetVelocity();
         b.t = Simulator::Now().GetSeconds();
         Vector truePos = mj->GetPosition();
-        for (uint32_t i = 0; i + 1 < g_n2Nodes.GetN(); ++i)
+        // With downlink C2 the ground station also listens to beacons: it needs to know
+        // which drones are within its own radio range to choose a first relay.
+        uint32_t nRx = g_c2Downlink ? g_n2Nodes.GetN() : g_n2Nodes.GetN() - 1;
+        for (uint32_t i = 0; i < nRx; ++i)
         {
             if (i == j)
                 continue;
@@ -1237,6 +1668,7 @@ main(int argc, char* argv[])
     double beaconMs = 100.0;          // N2: beacon / route-update interval
     double predMs = 500.0;            // N2: how far ahead to predict (ms)
     std::string n2Info = "ideal";     // N2: ideal (exact positions) or real (from received beacons)
+    std::string c2DlPos = "tracked";  // downlink: tracked (from uplink reports) or ideal
     double deadlineMs = 0.0;          // >0: discard data older than this (all modes; Wi-Fi queue too)
     bool n2Hold = true;               // N2: hold data when no relay exists (instead of sending into the void)
 
@@ -1247,7 +1679,21 @@ main(int argc, char* argv[])
     cmd.AddValue("areaSize", "Side of square area (m)", areaSize);
     cmd.AddValue("txPower", "Transmit power (dBm)", txPowerDbm);
     cmd.AddValue("flowRate", "Data rate per camera UAV", flowRate);
-    cmd.AddValue("routing", "OLSR, AODV, or N2 (trajectory-aware make-before-break)", routing);
+    cmd.AddValue("routing",
+                 "OLSR, AODV, N2 (trajectory-aware make-before-break), or PRED "
+                 "(link-expiration-prediction baseline: prediction only, no late binding, "
+                 "no hold, no C2 relay chain)",
+                 routing);
+    cmd.AddValue("letThreshS", "PRED: a link is usable while its expiration time exceeds this (s)",
+                 g_letThreshS);
+    cmd.AddValue("predHold",
+                 "PRED: when no neighbour qualifies, drop the route and hold instead of "
+                 "keeping a stale one (ladder step 3)",
+                 g_predHold);
+    cmd.AddValue("baseQueue",
+                 "OLSR/AODV: use N2's queue discipline (priority classes, deadline discard, "
+                 "N1 window) with their own routing, to separate queueing from routing",
+                 g_baseQueue);
     cmd.AddValue("run", "Random run number", run);
     cmd.AddValue("arpPrefill", "Pre-fill ARP neighbour tables (0/1)", arpPrefill);
     cmd.AddValue("mac", "CSMA (baseline) or N1 (altitude-banded TDMA)", macMode);
@@ -1281,6 +1727,12 @@ main(int argc, char* argv[])
     cmd.AddValue("c2Route", "C2 relay chain: 0 same as video, 1 short safe links only (needs c2Copies=1)", g_c2Route);
     cmd.AddValue("c2SafeFrac", "c2Route=1: max link length as a share of radio range", g_c2SafeFrac);
     cmd.AddValue("c2Copies", "C2 copies: 0 old app, 1 own app one path, 2 two paths (needs N2)", g_c2Copies);
+    cmd.AddValue("c2Downlink", "Also send C2 from the ground station to each C2 drone (0/1)",
+                 g_c2Downlink);
+    cmd.AddValue("c2DlPos", "Downlink destination position: tracked (from uplink reports) or ideal",
+                 c2DlPos);
+    cmd.AddValue("c2DlMaxAgeS", "Downlink: ignore a destination fix older than this (s)",
+                 g_c2DlMaxAgeS);
     cmd.AddValue("hearRange", "N2: real radio range (m)", g_n2Hear);
     cmd.AddValue("safeFrac", "N2: use links only within this fraction of range", g_n2SafeFrac);
     cmd.AddValue("jitterUs", "N1: random delay at slot start (us)", jitterUs);
@@ -1292,6 +1744,10 @@ main(int argc, char* argv[])
     {
         nCam = nUav;
     }
+    if (nC2 > nUav)
+    {
+        nC2 = nUav; // each C2 drone must be a distinct drone
+    }
     RngSeedManager::SetSeed(12345);
     RngSeedManager::SetRun(run);
 
@@ -1301,6 +1757,16 @@ main(int argc, char* argv[])
         Config::SetDefault("ns3::WifiMacQueue::MaxDelay", TimeValue(MilliSeconds(static_cast<int64_t>(deadlineMs))));
     }
     g_n2Real = (n2Info == "real");
+    g_c2DlIdealPos = (c2DlPos == "ideal");
+    g_predMode = (routing == "PRED");
+    if (g_predMode && g_c2Route != 0)
+    {
+        std::cerr << "  (PRED baseline: c2Route forced to 0. A traffic-class-specific relay\n"
+                     "   chain is one of the mechanisms being measured, so the baseline cannot\n"
+                     "   have it. Run --routing=N2 to include it.)"
+                  << std::endl;
+        g_c2Route = 0;
+    }
     g_n1Sf = MicroSeconds(static_cast<int64_t>(n1SfMs * 1000));
     g_c2Win = MicroSeconds(static_cast<int64_t>(c2WinMs * 1000));
     g_c2Deadline = MicroSeconds(static_cast<int64_t>(c2DeadlineMs * 1000));
@@ -1382,7 +1848,7 @@ main(int argc, char* argv[])
     {
         internet.SetRoutingHelper(aodv);
     }
-    else if (routing == "N2")
+    else if (routing == "N2" || routing == "PRED")
     {
         internet.SetRoutingHelper(staticRouting); // routes are written by N2UpdateRoutes
     }
@@ -1417,7 +1883,11 @@ main(int argc, char* argv[])
                   << superframe.GetMilliSeconds() << " ms" << std::endl;
     }
 
-    if (routing == "N2" && n2Hold && macMode != "N1")
+    // --baseQueue=1 gives OLSR or AODV the SAME queue discipline that N2 uses (three
+    // classes, deadline discard, and the N1 C2 window) while leaving their own routing
+    // alone. Without it, part of any N2-versus-OLSR gap is the queue, not the routing,
+    // and there is no way to tell how much. This separates the two.
+    if ((((routing == "N2" || routing == "PRED") && n2Hold) || g_baseQueue) && macMode != "N1")
     {
         TrafficControlHelper tchHold;
         tchHold.SetRootQueueDisc("ns3::N2HoldQueueDisc");
@@ -1445,7 +1915,34 @@ main(int argc, char* argv[])
         neighborCache.PopulateNeighborCache();
     }
 
-    if (routing == "N2")
+    // Two-way C2: which drones carry C2, and their addresses. Set up before routing starts.
+    g_groundIdx = nUav;
+    if (g_c2Downlink && nC2 > 0)
+    {
+        for (uint32_t k = 0; k < nC2; ++k)
+        {
+            uint32_t idx = (nCam + k) % nUav;
+            g_c2DestNode.push_back(idx);
+            g_c2DestAddr.push_back(ifaces.GetAddress(idx));
+            g_ipToDl[ifaces.GetAddress(idx).Get()] = k;
+            g_nodeToDl[idx] = k;
+        }
+        g_c2DestBelief.assign(nC2, C2Fix());
+        g_n2NextHopDl.assign(nUav + 1, std::vector<int>(nC2, -2));
+        std::cerr << "  C2 downlink on: ground -> " << nC2 << " drones, " << c2Bytes
+                  << " B every " << c2IntervalMs << " ms, destination position = " << c2DlPos
+                  << (g_c2DlIdealPos ? "" : " (from uplink reports)") << std::endl;
+        if ((routing == "N2" || routing == "PRED") && !g_c2DlIdealPos && g_c2Copies == 0)
+        {
+            std::cerr << "  *** c2Downlink=1 with c2DlPos=tracked needs c2Copies=1: the ground\n"
+                         "  *** station learns where each drone is from the numbered uplink\n"
+                         "  *** reports, which only the c2Copies=1 app sends. Add --c2Copies=1\n"
+                         "  *** (or use --c2DlPos=ideal) or no command will be routed."
+                      << std::endl;
+        }
+    }
+
+    if (routing == "N2" || routing == "PRED")
     {
         g_n2Nodes = all;
         g_n2Ifaces = ifaces;
@@ -1472,6 +1969,16 @@ main(int argc, char* argv[])
                                 &N2SendBeacon, i, s, beaconMs / 1000.0, brng);
         }
         Simulator::Schedule(Seconds(1.0), &N2UpdateRoutes, beaconMs / 1000.0);
+        if (g_predMode)
+        {
+            std::cerr << "  PRED baseline on: link-expiration prediction from the same beacons"
+                      << " (loss " << g_n2BeaconLoss << ", GPS error " << g_n2GpsErr << " m),"
+                      << " usable while LET > " << g_letThreshS << " s.\n"
+                      << "  Deliberately WITHOUT: late binding, "
+                      << (g_predHold ? "and WITH hold+deadline, " : "hold+deadline, ")
+                      << "and a C2 relay chain."
+                      << std::endl;
+        }
         std::cerr << "  N2 on: beacons every " << beaconMs << " ms, predict " << predMs
                   << " ms ahead, safe range " << g_n2Hear * g_n2SafeFrac << " m, info=" << n2Info
                   << " (beacon loss " << g_n2BeaconLoss << ", GPS error " << g_n2GpsErr
@@ -1518,7 +2025,8 @@ main(int argc, char* argv[])
         rx->SetRecvCallback(MakeCallback(&C2Receive));
         for (uint32_t k = 0; k < nC2; ++k)
         {
-            Ptr<Node> src = uavs.Get((nCam + k) % nUav);
+            uint32_t srcIdx = (nCam + k) % nUav;
+            Ptr<Node> src = uavs.Get(srcIdx);
             Ptr<Socket> s1 = Socket::CreateSocket(src, UdpSocketFactory::GetTypeId());
             s1->Connect(InetSocketAddress(groundAddr, 9101));
             Ptr<Socket> s2;
@@ -1533,7 +2041,7 @@ main(int argc, char* argv[])
                 s2->Connect(InetSocketAddress(groundAddr, 9101));
             }
             double st = trafficStart + 0.0137 * k;
-            Simulator::Schedule(Seconds(st), &C2SendTick, s1, s2, 0u, c2Bytes,
+            Simulator::Schedule(Seconds(st), &C2SendTick, srcIdx, s1, s2, 0u, c2Bytes,
                                 MicroSeconds(static_cast<int64_t>(c2IntervalMs * 1000)),
                                 Seconds(simTime - 1.0));
             c2Expected += std::ceil((simTime - 1.0 - st) * 1000.0 / c2IntervalMs);
@@ -1563,6 +2071,35 @@ main(int argc, char* argv[])
             std::cerr << " (own slots every " << n1SfMs << " ms, up to " << g_c2MaxFrac * 100
                       << "% of the cycle)";
         std::cerr << std::endl;
+    }
+
+    // ---------------- 6b. Downlink C2: ground station -> each C2 drone ----------------
+    // Same message size and period as the uplink report, same 40 ms deadline. Both
+    // directions share the one channel and the one protected window, which is the point
+    // of the test: the window that was sized for uplink alone now has to carry both.
+    if (g_c2Downlink && nC2 > 0)
+    {
+        for (uint32_t k = 0; k < nC2; ++k)
+        {
+            uint32_t dstIdx = g_c2DestNode[k];
+            Ptr<Socket> rx = Socket::CreateSocket(uavs.Get(dstIdx), UdpSocketFactory::GetTypeId());
+            rx->Bind(InetSocketAddress(Ipv4Address::GetAny(), 9102));
+            rx->SetRecvCallback(MakeBoundCallback(&C2ReceiveDl, k));
+
+            Ptr<Socket> tx = Socket::CreateSocket(ground.Get(0), UdpSocketFactory::GetTypeId());
+            if (g_c2Route == 1)
+            {
+                tx->SetIpTos(g_c2DupTos); // commands follow the short-link C2 chain too
+            }
+            tx->Connect(InetSocketAddress(g_c2DestAddr[k], 9102));
+            // Start half a C2 period after the uplink flows, so the ground has at least one
+            // position report for each drone before it starts sending commands.
+            double st = trafficStart + 0.5 + 0.0137 * k;
+            Simulator::Schedule(Seconds(st), &C2SendTickDl, k, tx, 0u, c2Bytes,
+                                MicroSeconds(static_cast<int64_t>(c2IntervalMs * 1000)),
+                                Seconds(simTime - 1.0));
+            g_c2DlExpected += std::ceil((simTime - 1.0 - st) * 1000.0 / c2IntervalMs);
+        }
     }
 
     g_connNodes = all;
@@ -1727,6 +2264,36 @@ main(int argc, char* argv[])
             c2Max = 1000.0 * (b + 1) * binWidth;
     }
     double c2In40Pct = c2Expected > 0 ? 100.0 * c2In40 / c2Expected : 0.0;
+
+    // Downlink C2 (ground -> drone), measured the same way and reported separately.
+    uint64_t c2DlRx = g_c2RecDl.firstDelay.size();
+    double c2DlDelaySum = 0.0;
+    std::vector<uint64_t> c2DlBins(1, 0);
+    for (auto& kv : g_c2RecDl.firstDelay)
+    {
+        c2DlDelaySum += kv.second;
+        uint32_t b = static_cast<uint32_t>(kv.second / binWidth);
+        if (b >= c2DlBins.size())
+            c2DlBins.resize(b + 1, 0);
+        ++c2DlBins[b];
+    }
+    double c2DlDelivPct = g_c2DlExpected > 0 ? 100.0 * c2DlRx / g_c2DlExpected : 0.0;
+    double c2DlMeanMs = c2DlRx > 0 ? 1000.0 * c2DlDelaySum / c2DlRx : 0.0;
+    uint64_t c2DlIn40 = 0, c2DlCum = 0;
+    double c2DlP99 = 0.0, c2DlMax = 0.0;
+    for (uint32_t b = 0; b < c2DlBins.size(); ++b)
+    {
+        if ((b + 1) * binWidth * 1000.0 <= 40.0 + 1e-9)
+            c2DlIn40 += c2DlBins[b];
+        c2DlCum += c2DlBins[b];
+        if (c2DlP99 == 0.0 && c2DlRx > 0 &&
+            c2DlCum >= static_cast<uint64_t>(std::ceil(0.99 * c2DlRx)))
+            c2DlP99 = 1000.0 * (b + 1) * binWidth;
+        if (c2DlBins[b] > 0)
+            c2DlMax = 1000.0 * (b + 1) * binWidth;
+    }
+    double c2DlIn40Pct = g_c2DlExpected > 0 ? 100.0 * c2DlIn40 / g_c2DlExpected : 0.0;
+
     double p95Ms = percentileMs(0.95);
     double p99Ms = percentileMs(0.99);
     double maxMs = 0.0;
@@ -1794,13 +2361,41 @@ main(int argc, char* argv[])
               << "ARP waiting queue full (neighbour discovery): " << g_arpQueueDrop << "\n"
               << "ARP gave up, neighbour never answered:        " << g_arpTimeoutDrop << "\n"
               << "(Wi-Fi counts are per hop, so they can exceed end-to-end losses.)\n";
-    if (routing == "N2")
+    if (g_c2Downlink)
     {
-        std::cout << "\n--- N2 behaviour ---\n"
+        std::cout << "\n--- Downlink C2 (ground station -> drone) ---\n"
+                  << "Destination position used: " << c2DlPos
+                  << (g_c2DlIdealPos ? " (exact; optimistic upper bound)"
+                                     : " (fix carried by the drone's own uplink report)")
+                  << "\n"
+                  << "Downlink C2 expected: " << g_c2DlExpected << "  received: " << c2DlRx << "\n"
+                  << "Downlink C2 delivered (any delay): " << c2DlDelivPct << " %\n"
+                  << "Downlink C2 within 40 ms (3GPP target 99.9 %): " << c2DlIn40Pct << " %\n"
+                  << "Downlink C2 mean / 99th-percentile / max delay: " << c2DlMeanMs << " / "
+                  << c2DlP99 << " / " << c2DlMax << " ms\n"
+                  << "Downlink not sent, no route at the ground:  " << g_c2DlSrcFail << "\n"
+                  << "Downlink held with no relay, then too old:  " << g_c2StaleDl << "\n"
+                  << "Route not computed, destination fix missing or stale: " << g_c2DlNoPos << "\n"
+                  << "Route computed with no safe relay (fallback used):    " << g_c2DlNoRelay
+                  << "\n"
+                  << "Downlink next-hop switches:                 " << g_c2DlSwitches << "\n"
+                  << "(The per-hop Wi-Fi C2 counters above pool BOTH directions: a dropped\n"
+                  << " frame is counted by size, which is the same in each direction.)\n";
+    }
+    if (routing == "N2" || routing == "PRED")
+    {
+        std::cout << (g_predMode ? "\n--- PRED baseline behaviour ---\n"
+                                 : "\n--- N2 behaviour ---\n")
                   << "Next-hop switches (make-before-break): " << g_n2Switches << "\n"
                   << "Times no SAFE neighbour existed:       " << g_n2Fallback << "\n"
                   << "Times no neighbour at all (data held):  " << g_n2NoNeighbour << "\n"
                   << "Data discarded as too old (deadline):  " << g_n2DeadlineDrops << "\n";
+        if (g_predMode)
+        {
+            std::cout << "Routes kept although nothing qualified: " << g_predStaleKeep
+                      << "   (LET threshold " << g_letThreshS << " s, hold "
+                      << (g_predHold ? "on" : "off") << ", late binding off)\n";
+        }
     }
 
     std::ofstream csv("swarm-baseline.csv", std::ios::app);
@@ -1821,7 +2416,29 @@ main(int argc, char* argv[])
         << g_n1C2 << "," << c2WinMs << "," << c2Expected << "," << c2Rx << ","
         << c2DelivPct << "," << c2In40Pct << "," << c2MeanMs << "," << c2P99 << "," << c2Max << "," << g_c2Copies << ","
         << g_c2Rec.dupes << "," << g_c2Route << "," << g_c2SafeFrac << "," << g_c2SrcFail << ","
-        << g_c2Stale << "," << g_c2RetryNear << "," << g_c2RetryFar << "," << g_c2MacExpired << "\n";
+        << g_c2Stale << "," << g_c2RetryNear << "," << g_c2RetryFar << "," << g_c2MacExpired
+        // ---- version 12 columns, appended so CSV columns 1-67 keep their old meaning ----
+        // (the sweep scripts prepend a tag, so awk field number = CSV column + 1)
+        << "," << (g_c2Downlink ? 1 : 0)   // 68 downlink on
+        << "," << c2DlPos                  // 69 destination position mode
+        << "," << g_c2DlExpected           // 70 downlink C2 expected
+        << "," << c2DlRx                   // 71 downlink C2 received
+        << "," << c2DlDelivPct             // 72 downlink delivered, any delay, %
+        << "," << c2DlIn40Pct              // 73 downlink within 40 ms, %
+        << "," << c2DlMeanMs               // 74 downlink mean delay, ms
+        << "," << c2DlP99                  // 75 downlink 99th-percentile delay, ms
+        << "," << c2DlMax                  // 76 downlink max delay, ms
+        << "," << g_c2DlSrcFail            // 77 not sent, no route at the ground
+        << "," << g_c2StaleDl              // 78 held, then discarded as too old
+        << "," << g_c2DlNoPos              // 79 destination fix missing or stale
+        << "," << g_c2DlNoRelay            // 80 no safe relay (fallback used)
+        << "," << g_c2DlSwitches           // 81 downlink next-hop switches
+        // ---- version 13 columns (PRED baseline) ----
+        << "," << (g_predMode ? 1 : 0)     // 82 PRED baseline
+        << "," << g_letThreshS             // 83 PRED link-expiration threshold, s
+        << "," << (g_predHold ? 1 : 0)     // 84 PRED with hold + deadline
+        << "," << g_predStaleKeep          // 85 routes kept although nothing qualified
+        << "\n";
     csv.close();
 
     Simulator::Destroy();
