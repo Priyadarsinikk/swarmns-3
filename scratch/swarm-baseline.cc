@@ -1600,6 +1600,62 @@ N2SendBeacon(uint32_t j, Ptr<Socket> s, double intervalS, Ptr<UniformRandomVaria
 // Physical connectivity: fraction of time each camera drone has ANY chain of links
 // (each no longer than the real radio range) to the ground station. Same flights, any routing.
 static NodeContainer g_connNodes;
+
+// =====================================================================================
+//  Version 14: in-band jamming
+// =====================================================================================
+//  Milestone M4 commits to operating with a fraction of the swarm jammed, and until now
+//  nothing in the model supported that claim. A jammer here is a stationary ground-based
+//  transmitter on the swarm's own channel, radiating saturating traffic at a chosen power.
+//  It is not a special model: it is an ordinary node whose frames collide with the swarm's,
+//  so the effect is produced by the same PHY and interference machinery as every other
+//  result in this study.
+//
+//  One limitation must be stated whenever these numbers are used. The jammer runs an
+//  802.11 MAC, so it defers when it senses the channel busy. A real barrage jammer does
+//  not. This model therefore understates the damage, and the figures it produces are
+//  optimistic rather than pessimistic. What it does capture is the dominant effect at
+//  these loads: airtime denial near the jammer and hidden-terminal collisions further out.
+//
+//  "Jammed fraction" is measured, not assumed: every 100 ms the model counts the UAVs
+//  within the jammer's own detection radius, derived from its power by the same Friis
+//  calculation that gives the swarm its 365 m range.
+static NodeContainer g_jamNodes;
+static double g_jamRangeM = 0.0;
+static uint64_t g_jamSamples = 0, g_jamHits = 0;
+static uint64_t g_jamSent = 0;
+
+static void
+JamTick(Ptr<Socket> s, uint32_t bytes, Time interval, Time stop)
+{
+    if (Simulator::Now() >= stop)
+        return;
+    s->Send(Create<Packet>(bytes));
+    ++g_jamSent;
+    Simulator::Schedule(interval, &JamTick, s, bytes, interval, stop);
+}
+
+// Fraction of UAVs inside the jammers' detection radius, sampled over the run.
+static void
+LogJammed(double intervalS, uint32_t nUav)
+{
+    for (uint32_t i = 0; i < nUav; ++i)
+    {
+        Vector p = g_connNodes.Get(i)->GetObject<MobilityModel>()->GetPosition();
+        bool hit = false;
+        for (uint32_t j = 0; j < g_jamNodes.GetN() && !hit; ++j)
+        {
+            if (CalculateDistance(p, g_jamNodes.Get(j)->GetObject<MobilityModel>()->GetPosition()) <=
+                g_jamRangeM)
+                hit = true;
+        }
+        ++g_jamSamples;
+        if (hit)
+            ++g_jamHits;
+    }
+    Simulator::Schedule(Seconds(intervalS), &LogJammed, intervalS, nUav);
+}
+
 static uint32_t g_connCams = 0;
 static uint64_t g_connSamples = 0;
 static uint64_t g_connHits = 0;
@@ -1655,6 +1711,10 @@ main(int argc, char* argv[])
     double minAlt = 50.0;        // metres
     double maxAlt = 150.0;       // metres
     double txPowerDbm = 16.0;    // transmit power
+    uint32_t nJam = 0;           // number of in-band jammers
+    double jamPowerDbm = 16.0;   // jammer transmit power
+    std::string jamRate = "2Mbps"; // offered load per jammer
+    double jamStart = 40.0;      // jamming begins at this time (s)
     std::string flowRate = "300kbps"; // per camera drone
     std::string routing = "OLSR";     // OLSR or AODV
     uint32_t run = 1;            // random-run number (repeat with 1..10 for statistics)
@@ -1727,6 +1787,10 @@ main(int argc, char* argv[])
     cmd.AddValue("c2Route", "C2 relay chain: 0 same as video, 1 short safe links only (needs c2Copies=1)", g_c2Route);
     cmd.AddValue("c2SafeFrac", "c2Route=1: max link length as a share of radio range", g_c2SafeFrac);
     cmd.AddValue("c2Copies", "C2 copies: 0 old app, 1 own app one path, 2 two paths (needs N2)", g_c2Copies);
+    cmd.AddValue("nJam", "Number of in-band jammers (0 = none)", nJam);
+    cmd.AddValue("jamPowerDbm", "Jammer transmit power (dBm)", jamPowerDbm);
+    cmd.AddValue("jamRate", "Offered load per jammer", jamRate);
+    cmd.AddValue("jamStart", "Time at which jamming begins (s)", jamStart);
     cmd.AddValue("c2Downlink", "Also send C2 from the ground station to each C2 drone (0/1)",
                  g_c2Downlink);
     cmd.AddValue("c2DlPos", "Downlink destination position: tracked (from uplink reports) or ideal",
@@ -2102,15 +2166,82 @@ main(int argc, char* argv[])
         }
     }
 
+    // ---------------- 6d. In-band jammers ----------------
+    // Created last so that UAV and ground-station node indices are unchanged, which keeps
+    // every routing table, MAC address map and queue disc index identical to a clean run.
+    NodeContainer jammers;
+    if (nJam > 0)
+    {
+        jammers.Create(nJam);
+        YansWifiPhyHelper jphy = phy; // same channel object
+        jphy.Set("TxPowerStart", DoubleValue(jamPowerDbm));
+        jphy.Set("TxPowerEnd", DoubleValue(jamPowerDbm));
+        WifiMacHelper jmac;
+        jmac.SetType("ns3::AdhocWifiMac");
+        NetDeviceContainer jdev = wifi.Install(jphy, jmac, jammers);
+
+        // Jammer positions come from a dedicated random stream, so that for a given seed
+        // they are identical whatever routing scheme is under test. Without this the draw
+        // depends on how many random values the rest of the set-up happened to consume,
+        // the jammer lands somewhere different for each scheme, and the comparison between
+        // schemes is not a paired one.
+        Ptr<UniformRandomVariable> jr = CreateObject<UniformRandomVariable>();
+        jr->SetStream(7777);
+        Ptr<ListPositionAllocator> jpos = CreateObject<ListPositionAllocator>();
+        for (uint32_t j = 0; j < nJam; ++j)
+        {
+            jpos->Add(Vector(jr->GetValue(0.0, areaSize), jr->GetValue(0.0, areaSize), 1.5));
+        }
+        MobilityHelper jmob;
+        jmob.SetPositionAllocator(jpos);
+        jmob.SetMobilityModel("ns3::ConstantPositionMobilityModel");
+        jmob.Install(jammers);
+
+        InternetStackHelper jnet;
+        jnet.Install(jammers);
+        Ipv4AddressHelper jip;
+        jip.SetBase("10.9.0.0", "255.255.0.0");
+        jip.Assign(jdev);
+
+        uint32_t jbytes = 1000;
+        double jbps = static_cast<double>(DataRate(jamRate).GetBitRate());
+        Time jint = Seconds(jbytes * 8.0 / jbps);
+        for (uint32_t j = 0; j < nJam; ++j)
+        {
+            Ptr<Socket> js = Socket::CreateSocket(jammers.Get(j), UdpSocketFactory::GetTypeId());
+            js->SetAllowBroadcast(true);
+            js->Connect(InetSocketAddress(Ipv4Address("10.9.255.255"), 9999));
+            Simulator::Schedule(Seconds(jamStart + 0.001 * j), &JamTick, js, jbytes, jint,
+                                Seconds(simTime - 1.0));
+        }
+        // Detection radius of the jammer, from its power, by the same Friis calculation
+        // that gives the swarm its radio range.
+        g_jamRangeM = g_n2Hear * std::pow(10.0, (jamPowerDbm - txPowerDbm) / 20.0);
+        g_jamNodes = jammers;
+        std::cerr << "  Jamming on: " << nJam << " stationary in-band jammers at "
+                  << jamPowerDbm << " dBm, " << jamRate << " each, from " << jamStart
+                  << " s; detection radius " << g_jamRangeM << " m" << std::endl;
+    }
+
     g_connNodes = all;
     g_connCams = nCam;
     Simulator::Schedule(Seconds(trafficStart), &LogConnectivity, 0.1, g_n2Hear);
+    if (nJam > 0)
+    {
+        Simulator::Schedule(Seconds(jamStart), &LogJammed, 0.1, nUav);
+    }
 
     // ---------------- 7. Measurement ----------------
     Config::ConnectWithoutContext("/NodeList/*/ApplicationList/*/$ns3::OnOffApplication/Tx",
                                   MakeCallback(&AppTxCounter));
-    Config::Connect("/NodeList/*/DeviceList/*/$ns3::WifiNetDevice/Mac/DroppedMpdu",
-                    MakeCallback(&MacDrop));
+    // Only the swarm's own radios: a jammer's dropped frames are not swarm losses.
+    for (uint32_t i = 0; i < all.GetN(); ++i)
+    {
+        std::ostringstream path;
+        path << "/NodeList/" << all.Get(i)->GetId()
+             << "/DeviceList/*/$ns3::WifiNetDevice/Mac/DroppedMpdu";
+        Config::Connect(path.str(), MakeCallback(&MacDrop));
+    }
     // ARP drops (FailSafe: if a path does not exist in this ns-3 version, it is skipped, not fatal)
     bool okArpQ = Config::ConnectWithoutContextFailSafe("/NodeList/*/$ns3::ArpL3Protocol/Drop",
                                                         MakeCallback(&ArpQueueDrop));
@@ -2361,6 +2492,17 @@ main(int argc, char* argv[])
               << "ARP waiting queue full (neighbour discovery): " << g_arpQueueDrop << "\n"
               << "ARP gave up, neighbour never answered:        " << g_arpTimeoutDrop << "\n"
               << "(Wi-Fi counts are per hop, so they can exceed end-to-end losses.)\n";
+    double jamFrac = g_jamSamples > 0 ? 100.0 * g_jamHits / g_jamSamples : 0.0;
+    if (nJam > 0)
+    {
+        std::cout << "\n--- Jamming ---\n"
+                  << "Jammers: " << nJam << " at " << jamPowerDbm << " dBm, " << jamRate
+                  << " each, from " << jamStart << " s\n"
+                  << "Jammer detection radius: " << g_jamRangeM << " m\n"
+                  << "UAVs inside a jammer's radius (mean over the run): " << jamFrac << " %\n"
+                  << "Jamming frames transmitted: " << g_jamSent << "\n"
+                  << "(The jammer obeys carrier sense, so this understates a barrage jammer.)\n";
+    }
     if (g_c2Downlink)
     {
         std::cout << "\n--- Downlink C2 (ground station -> drone) ---\n"
@@ -2438,6 +2580,12 @@ main(int argc, char* argv[])
         << "," << g_letThreshS             // 83 PRED link-expiration threshold, s
         << "," << (g_predHold ? 1 : 0)     // 84 PRED with hold + deadline
         << "," << g_predStaleKeep          // 85 routes kept although nothing qualified
+        // ---- version 14 columns (jamming) ----
+        << "," << nJam                     // 86 number of jammers
+        << "," << jamPowerDbm              // 87 jammer power, dBm
+        << "," << jamRate                  // 88 offered load per jammer
+        << "," << jamFrac                  // 89 UAVs inside a jammer radius, % of samples
+        << "," << g_jamSent                // 90 jamming frames transmitted
         << "\n";
     csv.close();
 

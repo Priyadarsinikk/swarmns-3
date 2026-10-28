@@ -6,6 +6,7 @@ The model runs on ns-3.49 and compares standard mesh routing (OLSR, AODV) and a 
 
 - **N2, trajectory-aware routing:** UAVs share position and velocity in 40-byte beacons every 100 ms. A relay is used only if it is predicted to stay in range 0.5 s ahead, the next hop is bound at the moment of transmission rather than at the last routing update, and data is held rather than transmitted when no relay qualifies. C2 uses a separate chain of short links (70% of radio range).
 - **N1, C2-protecting MAC:** a 3 ms window every 20 ms in which only command-and-control (C2) frames may be sent, with C2 older than 40 ms discarded.
+- **Jamming:** in-band interferers with a measured jammed fraction, so the behaviour of each scheme under denial can be compared on identical jammer placements.
 - **PRED, a predictive baseline:** link expiration time from relative position and velocity, in the manner of Su, Lee and Gerla, written into the routing table and left there until the next update. It has the prediction but none of the three mechanisms above, so each one can be measured separately. It is not a reimplementation of any published protocol and should not be cited as one.
 
 ## Contents
@@ -39,6 +40,10 @@ Key options added since the first release:
 | `--c2Downlink=1` | also send C2 from the ground station to each C2 drone |
 | `--c2DlPos` | `tracked` (destination position from its own uplink reports) or `ideal` |
 | `--safeFrac` | N2 relay range margin as a fraction of radio range (default 0.85) |
+| `--nJam` | number of in-band jammers (default 0) |
+| `--jamPowerDbm` | jammer transmit power; sets its denial radius |
+| `--jamRate` | offered load per jammer (default 2Mbps) |
+| `--jamStart` | time at which jamming begins (default 40 s) |
 
 ## Simulation set-up
 
@@ -102,6 +107,55 @@ The outward direction is the harder one, and it is where N2's mechanisms matter 
 
 Routing toward a moving destination needs its position. The command carries the destination's last reported GPS fix, taken from its own uplink report. Giving every relay the destination's exact current position instead (`--c2DlPos=ideal`, not implementable) gains about one point: 80.3% and 55.2%. The outward path therefore depends on the inward one.
 
+### Operation under jamming
+
+A jammer is a stationary transmitter on the swarm's own channel radiating saturating traffic
+at a chosen power. It is an ordinary node, so the damage comes from the same PHY and
+interference machinery as every other result here. The jammed fraction is **measured**, not
+assumed: every 100 ms the model counts UAVs inside a jammer's detection radius, derived from
+its power by the same Friis calculation that gives the swarm its 365 m range. Jammer
+positions come from a dedicated random stream, so for a given seed every routing scheme
+faces jammers in identical positions and the comparison is paired.
+
+| Condition | Nodes jammed | N2 C2 | OLSR C2 | N2 video | OLSR video |
+|---|---|---|---|---|---|
+| 1 km, light video | 0% | 99.2% | 74.6% | 95.3% | 69.2% |
+| 1 km, light video | 20.2% | 89.9% | 61.5% | 73.7% | 56.7% |
+| 1 km, heavy video | 0% | 92.3% | 58.7% | 52.5% | 52.3% |
+| 1 km, heavy video | 20.2% | 80.8% | 46.7% | 37.3% | 40.2% |
+
+C2 within 40 ms against measured jammed fraction, heavy video (N2 / OLSR):
+
+| Jammers | Jammed | N2 | OLSR |
+|---|---|---|---|
+| 1 at 8 dBm | 3.2% | 90.0% | 54.7% |
+| 1 at 12 dBm | 12.6% | 86.4% | 50.8% |
+| 2 at 12 dBm | 20.2% | 80.8% | 46.7% |
+| 3 at 12 dBm | 29.3% | 74.2% | 42.2% |
+| 1 at 16 dBm | 33.5% | 83.7% | 48.4% |
+
+Four things this shows:
+
+1. **The C2 advantage holds on every seed.** Across three jamming configurations and five
+   seeds, N2 delivered more C2 on time than OLSR in all fifteen paired comparisons. On the
+   worst seed at the heaviest jamming, N2 reached 38.5% against OLSR's 22.9%.
+2. **C2 degrades more gently in the light case**, 9.4 points lost against OLSR's 13.1. This
+   is a property of N2 rather than an anti-jamming feature: a jammed neighbour behaves like
+   a link that is failing, which is the condition N2 already predicts and routes around.
+3. **Under heavy video and jamming together, OLSR delivers slightly more video than N2**
+   (40.2% against 37.3%, on four of five seeds). That is the N1 window reserving airtime
+   for commands, paid for in video. At the same operating point N2 has 80.8% of commands on
+   time against OLSR's 46.7%.
+4. **The jammed fraction does not by itself predict the damage.** Three jammers covering
+   29.3% cost more C2 than one covering 33.5%, because three denial zones fragment the
+   network while one larger zone can be routed around. Report power and count as separate
+   series rather than one curve.
+
+**Limitation.** The jammer runs an 802.11 MAC and defers when it senses the channel busy; a
+barrage jammer does not. These figures understate a real jammer. What the model captures is
+airtime denial near the jammer and hidden-terminal collisions further out, which dominate at
+these loads. A non-deferring interferer is future work.
+
 ### Parameter sweeps
 
 N2 relay range margin, video within 100 ms:
@@ -132,6 +186,7 @@ N1 window length with two-way C2 at 5 × 600 kbps: widening from 3 ms to 6 ms ra
 | T | the look-ahead sweep |
 | B | the two-way C2 table |
 | W | the window length sweep |
+| J | the jamming table |
 
 ## Approaches tested and rejected
 

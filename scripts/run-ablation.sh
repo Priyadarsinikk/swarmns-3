@@ -8,6 +8,7 @@
 #   T  LET-threshold sweep the baseline's look-ahead, 0.5 to 3 s (shows it is not handicapped)
 #   B  two-way C2          uplink and downlink commands together
 #   W  C2 window sweep     3 / 4 / 5 ms with two-way traffic
+#   J  jamming            in-band jammers, N2 against OLSR, jammed fraction measured
 #
 #   bash run-ablation.sh quick        seed 3 only
 #   bash run-ablation.sh quick LS     seed 3, ladder and safe-fraction only
@@ -19,7 +20,7 @@ echo "Building swarm-baseline once before starting..."
 ./ns3 build swarm-baseline
 
 RUNS="1 2 3 4 5"; [ "$1" = "quick" ] && RUNS="3"
-BLOCKS="${2:-RLSTBW}"
+BLOCKS="${2:-RLSTBWJ}"
 OUT="$PWD/results/ablation-$(date +%Y%m%d-%H%M)"
 mkdir -p "$OUT"
 JOBS=$(( $(nproc) - 1 )); [ "$JOBS" -lt 1 ] && JOBS=1
@@ -83,6 +84,25 @@ for run in $RUNS; do
     done
   ;; esac
 
+  case "$BLOCKS" in *J*)
+    # Jamming. Power sets the denial radius: at 16 dBm the jammer is heard as far as a UAV
+    # (365 m), at 12 dBm about 230 m, at 8 dBm about 145 m. Counts and powers are swept so
+    # that the jammed fraction, which the model measures rather than assumes, spans the
+    # 20% figure that milestone M4 commits to.
+    for jp in 8 12 16; do
+      echo "J-heavy50-n2-1jam-p$jp-run$run|--routing=N2 $HEAVY50 --run=$run --c2Route=1 --c2SafeFrac=0.7 --nJam=1 --jamPowerDbm=$jp"
+      echo "J-heavy50-olsr-1jam-p$jp-run$run|--routing=OLSR $HEAVY50 --run=$run --nJam=1 --jamPowerDbm=$jp"
+    done
+    for nj in 2 3; do
+      echo "J-heavy50-n2-${nj}jam-p12-run$run|--routing=N2 $HEAVY50 --run=$run --c2Route=1 --c2SafeFrac=0.7 --nJam=$nj --jamPowerDbm=12"
+      echo "J-heavy50-olsr-${nj}jam-p12-run$run|--routing=OLSR $HEAVY50 --run=$run --nJam=$nj --jamPowerDbm=12"
+    done
+    echo "J-dense50-n2-2jam-p12-run$run|--routing=N2 $DENSE50 --run=$run --c2Route=1 --c2SafeFrac=0.7 --nJam=2 --jamPowerDbm=12"
+    echo "J-dense50-olsr-2jam-p12-run$run|--routing=OLSR $DENSE50 --run=$run --nJam=2 --jamPowerDbm=12"
+    echo "J-dense50-n2-0jam-run$run|--routing=N2 $DENSE50 --run=$run --c2Route=1 --c2SafeFrac=0.7 --nJam=0"
+    echo "J-dense50-olsr-0jam-run$run|--routing=OLSR $DENSE50 --run=$run --nJam=0"
+  ;; esac
+
   case "$BLOCKS" in *W*)
     for w in 3 4 5 6; do
       echo "W-heavyA-win${w}ms-run$run|--routing=N2 $HEAVY50 --run=$run --c2Route=1 --c2SafeFrac=0.7 --c2Downlink=1 --c2DlPos=tracked --c2WinMs=$w"
@@ -104,10 +124,10 @@ done > "$OUT/all-with-tags.csv"
 echo
 echo "Combined results: $OUT/all-with-tags.csv"
 echo
-echo "tag | video within 100 ms % | uplink C2 within 40 ms % | downlink C2 within 40 ms % | connected %"
-awk -F, '{printf "%s | %.2f | %.2f | %.2f | %.1f\n", $1,$44,$56,$74,$42}' "$OUT/all-with-tags.csv" | sort
+echo "tag | video within 100 ms % | uplink C2 within 40 ms % | downlink C2 within 40 ms % | connected % | jammed %"
+awk -F, '{printf "%s | %.2f | %.2f | %.2f | %.1f | %.1f\n", $1,$44,$56,$74,$42,$90}' "$OUT/all-with-tags.csv" | sort
 echo
 echo "Means over seeds (strip the run suffix):"
-awk -F, '{k=$1; sub(/-run[0-9]+$/,"",k); v[k]+=$44; c[k]+=$56; d[k]+=$74; n[k]++}
-         END{for(k in n) printf "%-40s video=%6.2f  c2_up=%6.2f  c2_dn=%6.2f  (n=%d)\n", k, v[k]/n[k], c[k]/n[k], d[k]/n[k], n[k]}' \
+awk -F, '{k=$1; sub(/-run[0-9]+$/,"",k); v[k]+=$44; c[k]+=$56; d[k]+=$74; j[k]+=$90; n[k]++}
+         END{for(k in n) printf "%-40s video=%6.2f  c2_up=%6.2f  c2_dn=%6.2f  jammed=%5.1f  (n=%d)\n", k, v[k]/n[k], c[k]/n[k], d[k]/n[k], j[k]/n[k], n[k]}' \
   "$OUT/all-with-tags.csv" | sort
